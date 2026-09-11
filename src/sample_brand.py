@@ -2,7 +2,7 @@
 
 Reads the large CSV in chunks so the full dataset does not need to fit in memory.
 Ranks candidate support brands using outbound support volume and the number of
-customer messages those support accounts directly replied to.
+unique inbound customer tweets directly answered by each support account.
 
 Usage:
     python src/sample_brand.py --input data/raw/twcs.csv
@@ -11,7 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -41,11 +41,13 @@ def main() -> None:
         raise FileNotFoundError(f"Dataset not found: {args.input}")
 
     outbound = Counter()
-    replied_customer_tweets = Counter()
     total_rows = 0
     total_inbound = 0
     total_outbound = 0
 
+    # Pass 1: collect all inbound/customer tweet IDs. This lets us verify that
+    # an outbound tweet really answers a customer message.
+    inbound_ids: set[str] = set()
     reader = pd.read_csv(
         args.input,
         chunksize=args.chunksize,
@@ -54,37 +56,57 @@ def main() -> None:
     )
 
     for chunk_number, chunk in enumerate(reader, start=1):
-        total_rows += len(chunk)
         inbound_mask = chunk["inbound"].astype(str).str.lower().eq("true")
-        outbound_mask = ~inbound_mask
-
-        outbound_authors = chunk.loc[outbound_mask, "author_id"].astype(str)
-        outbound.update(outbound_authors)
-
-        # For an outbound support tweet, in_response_to_tweet_id points to the
-        # customer tweet it is answering. Count these links per support account.
-        replied = chunk.loc[outbound_mask, ["author_id", "in_response_to_tweet_id"]].copy()
-        replied = replied.dropna(subset=["in_response_to_tweet_id"])
-        replied_customer_tweets.update(replied["author_id"].astype(str))
-
+        ids = chunk.loc[inbound_mask, "tweet_id"].dropna().astype(str)
+        inbound_ids.update(ids)
         total_inbound += int(inbound_mask.sum())
-        total_outbound += int(outbound_mask.sum())
+        total_rows += len(chunk)
 
         if chunk_number % 10 == 0:
-            print(f"Processed {total_rows:,} rows...", flush=True)
+            print(f"Pass 1 processed {total_rows:,} rows...", flush=True)
+
+    # Pass 2: rank support accounts and count unique customer tweets they answer.
+    answered_by_brand: dict[str, set[str]] = defaultdict(set)
+    total_rows_pass2 = 0
+    reader = pd.read_csv(
+        args.input,
+        chunksize=args.chunksize,
+        usecols=lambda column: column in REQUIRED_COLUMNS,
+        low_memory=True,
+    )
+
+    for chunk_number, chunk in enumerate(reader, start=1):
+        inbound_mask = chunk["inbound"].astype(str).str.lower().eq("true")
+        outbound_mask = ~inbound_mask
+        outbound_rows = chunk.loc[outbound_mask, ["author_id", "in_response_to_tweet_id"]].dropna(
+            subset=["author_id"]
+        )
+
+        outbound.update(chunk.loc[outbound_mask, "author_id"].astype(str))
+        total_outbound += int(outbound_mask.sum())
+
+        for row in outbound_rows.itertuples(index=False):
+            brand = str(row.author_id)
+            parent_id = str(row.in_response_to_tweet_id)
+            if parent_id in inbound_ids:
+                answered_by_brand[brand].add(parent_id)
+
+        total_rows_pass2 += len(chunk)
+        if chunk_number % 10 == 0:
+            print(f"Pass 2 processed {total_rows_pass2:,} rows...", flush=True)
 
     print("\n=== Dataset reconnaissance ===")
     print(f"Rows scanned:       {total_rows:,}")
     print(f"Inbound tweets:     {total_inbound:,}")
     print(f"Outbound tweets:    {total_outbound:,}")
-    print(f"Unique authors:     {len(outbound):,} outbound authors")
+    print(f"Unique outbound authors: {len(outbound):,}")
 
     print(f"\n=== Top {args.top} likely support brands ===")
     print(f"{'Rank':<5} {'Brand':<25} {'Replies':>10} {'Customer tweets answered':>25}")
     print("-" * 70)
 
     for rank, (brand, reply_count) in enumerate(outbound.most_common(args.top), start=1):
-        customer_count = replied_customer_tweets.get(brand, 0)
+        customer_count = len(answered_by_brand.get(brand, set()))
         print(f"{rank:<5} {brand:<25} {reply_count:>10,} {customer_count:>25,}")
 
 
