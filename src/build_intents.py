@@ -1,14 +1,13 @@
-"""Discover candidate AmazonHelp intents with sentence embeddings.
+"""Discover candidate AmazonHelp intents with lightweight semantic clustering.
 
-This is an exploratory, reproducible step—not the final taxonomy. Customer
-messages are cleaned, embedded with a small general-purpose sentence model,
-and clustered at several candidate K values. The output is intended for
-human review before final intent labels are frozen.
+This exploratory step intentionally avoids heavyweight transformer/PyTorch
+dependencies. Customer messages are cleaned, represented with TF-IDF, reduced
+with LSA (TruncatedSVD), and clustered at several candidate K values. The
+output is for human review before final intent labels are frozen.
 
 Usage:
     python src/build_intents.py
-    python src/build_intents.py --input data/processed/amazonhelp_pairs.jsonl
-    python src/build_intents.py --clusters 10 12 15 18
+    python src/build_intents.py --clusters 8 10 12 15
 """
 
 from __future__ import annotations
@@ -19,22 +18,20 @@ import re
 from pathlib import Path
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
-
-
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
+from sklearn.preprocessing import Normalizer
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Discover candidate support intents")
     p.add_argument("--input", type=Path, default=Path("data/processed/amazonhelp_pairs.jsonl"))
     p.add_argument("--output-dir", type=Path, default=Path("data/processed"))
-    p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--clusters", type=int, nargs="+", default=[8, 10, 12, 15])
     p.add_argument("--examples-per-cluster", type=int, default=8)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--components", type=int, default=100)
     return p.parse_args()
 
 
@@ -55,8 +52,6 @@ def is_usable(text: str) -> bool:
     words = re.findall(r"\b\w+\b", text)
     if len(words) < 3:
         return False
-    # These are useful for the production dataset but usually do not define
-    # an actionable support intent by themselves.
     normalized = " ".join(words)
     noise = {
         "thanks", "thank you", "thx", "ok", "okay", "great", "perfect",
@@ -65,15 +60,15 @@ def is_usable(text: str) -> bool:
     return normalized not in noise
 
 
-def representative_indices(embeddings: np.ndarray, labels: np.ndarray, cluster_id: int, limit: int) -> np.ndarray:
+def representative_indices(
+    embedding: np.ndarray, labels: np.ndarray, cluster_id: int, limit: int
+) -> np.ndarray:
     indices = np.where(labels == cluster_id)[0]
     if not len(indices):
         return indices
-    centroid = embeddings[indices].mean(axis=0)
-    # Embeddings are normalized, so cosine distance is equivalent to ranking
-    # by dot product with the centroid after normalization.
-    centroid = centroid / max(np.linalg.norm(centroid), 1e-12)
-    scores = embeddings[indices] @ centroid
+    centroid = embedding[indices].mean(axis=0)
+    centroid /= max(np.linalg.norm(centroid), 1e-12)
+    scores = embedding[indices] @ centroid
     return indices[np.argsort(scores)[::-1][:limit]]
 
 
@@ -90,7 +85,9 @@ def cluster_once(
     sample_size = min(2000, len(embeddings))
     rng = np.random.default_rng(42)
     sample_idx = rng.choice(len(embeddings), size=sample_size, replace=False)
-    silhouette = silhouette_score(embeddings[sample_idx], labels[sample_idx], metric="cosine")
+    silhouette = silhouette_score(
+        embeddings[sample_idx], labels[sample_idx], metric="cosine"
+    )
 
     clusters = []
     for cluster_id in range(k):
@@ -108,11 +105,12 @@ def cluster_once(
         )
 
     clusters.sort(key=lambda x: x["size"], reverse=True)
+    sizes = [c["size"] for c in clusters]
     return {
         "clusters": k,
         "silhouette_score_sample": round(float(silhouette), 4),
-        "cluster_size_min": int(min(len(np.where(labels == c)[0]) for c in range(k))),
-        "cluster_size_max": int(max(len(np.where(labels == c)[0]) for c in range(k))),
+        "cluster_size_min": int(min(sizes)),
+        "cluster_size_max": int(max(sizes)),
         "clusters_detail": clusters,
     }
 
@@ -137,22 +135,29 @@ def main() -> None:
             f"Need at least {max(args.clusters)} usable messages, found {len(usable_clean)}"
         )
 
-    print("=== Intent discovery: sentence embeddings ===")
+    print("=== Intent discovery: TF-IDF + LSA ===")
     print(f"Input messages:    {len(records):,}")
     print(f"Usable messages:   {len(usable_clean):,}")
     print(f"Excluded noise:    {len(records) - len(usable_clean):,}")
-    print(f"Embedding model:   {args.model}")
-    print("Encoding messages...")
 
-    encoder = SentenceTransformer(args.model)
-    embeddings = encoder.encode(
-        usable_clean,
-        batch_size=args.batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        min_df=2,
+        max_df=0.95,
+        sublinear_tf=True,
+        max_features=20_000,
+        stop_words="english",
     )
-    embeddings = np.asarray(embeddings, dtype=np.float32)
+    X = vectorizer.fit_transform(usable_clean)
+    print(f"TF-IDF features:   {X.shape[1]:,}")
+
+    components = min(args.components, X.shape[1] - 1, len(usable_clean) - 1)
+    svd = TruncatedSVD(n_components=components, random_state=42)
+    embeddings = svd.fit_transform(X)
+    embeddings = Normalizer(copy=False).fit_transform(embeddings).astype(np.float32)
+    explained = float(svd.explained_variance_ratio_.sum())
+    print(f"LSA components:    {components}")
+    print(f"Variance retained: {explained:.4f}")
 
     results = []
     for k in sorted(set(args.clusters)):
@@ -168,12 +173,14 @@ def main() -> None:
     results.sort(key=lambda x: x["silhouette_score_sample"], reverse=True)
     output = args.output_dir / "intent_candidates.json"
     payload = {
-        "method": "SentenceTransformer embeddings + KMeans",
-        "model": args.model,
+        "method": "TF-IDF (1-2 grams) + TruncatedSVD/LSA + KMeans",
         "random_state": 42,
         "input_messages": len(records),
         "usable_messages": len(usable_clean),
         "excluded_noise_messages": len(records) - len(usable_clean),
+        "tfidf_features": int(X.shape[1]),
+        "lsa_components": int(components),
+        "lsa_variance_retained": round(explained, 4),
         "note": (
             "Exploratory candidate groups only. The highest silhouette score is "
             "not automatically the best business taxonomy; human review should "
