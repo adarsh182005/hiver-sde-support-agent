@@ -1,0 +1,88 @@
+{
+  "brand": "AmazonHelp",
+  "status": "candidate_v1_for_golden_set_labeling",
+  "source": {
+    "support_pairs": 5000,
+    "usable_for_clustering": 4730,
+    "discovery_method": "TF-IDF (1-2 grams) + TruncatedSVD/LSA + KMeans",
+    "tested_k": [8, 10, 12, 15],
+    "best_silhouette_k": 15,
+    "best_silhouette": 0.1480,
+    "warning": "Clusters are exploratory and mixed; labels below are manually consolidated into actionable support intents rather than copied directly from cluster IDs."
+  },
+  "intents": [
+    {
+      "id": "order_status_tracking",
+      "name": "Order status / tracking",
+      "description": "Customer wants to know where an order is, its current status, or tracking information.",
+      "examples_from_discovery": ["Nothing on my order on your web site.", "I don't see it"]
+    },
+    {
+      "id": "delivery_delay",
+      "name": "Delivery delay",
+      "description": "Expected delivery has passed or the shipment is repeatedly delayed without being delivered.",
+      "examples_from_discovery": ["Why it's me who should always follow up and not Amazon?", "my regular subscribe and save shipment"]
+    },
+    {
+      "id": "delivery_attempt_problem",
+      "name": "Delivery attempt / driver problem",
+      "description": "A delivery was missed, falsely marked attempted, left somewhere unexpected, or otherwise mishandled by the delivery service.",
+      "examples_from_discovery": ["there was no indication that they had re-attempted delivery", "do you take any action when delivery boy falsely claims that he attempted delivery"]
+    },
+    {
+      "id": "payment_billing",
+      "name": "Payment / billing",
+      "description": "Payment failure, card issue, unexpected charge, or other checkout/billing problem.",
+      "examples_from_discovery": ["problem with the payment", "the card needs a day ... to activate"]
+    },
+    {
+      "id": "refund",
+      "name": "Refund",
+      "description": "Customer asks about a refund, refund timing, or a refund that has not arrived.",
+      "examples_from_discovery": ["How much more time is required for refunding"]
+    },
+    {
+      "id": "return_replacement",
+      "name": "Return / replacement",
+      "description": "Customer needs help returning an item, replacing it, or resolving a return workflow problem.",
+      "examples_from_discovery": ["I'm getting the run around on a return.", "when I try to return a book"]
+    },
+    {
+      "id": "order_change_cancellation",
+      "name": "Order cancellation / change",
+      "description": "Customer wants to cancel, modify, or resolve a stuck/frozen order.",
+      "examples_from_discovery": ["response for the cancellation of the order", "I have had an order frozen for a month"]
+    },
+    {
+      "id": "prime_subscription",
+      "name": "Prime / subscription",
+      "description": "Questions or problems involving Prime membership, Prime Video, subscription charges, or cancellation.",
+      "examples_from_discovery": ["What is the point of Prime", "Cancelación de membresía Amazon Prime y reembolso ya!"]
+    },
+    {
+      "id": "product_item_issue",
+      "name": "Product / item issue",
+      "description": "Customer reports a damaged, defective, incorrectly packaged, missing, or otherwise problematic item.",
+      "examples_from_discovery": ["the packaging's fault", "screen ... opened ... there was a crack"]
+    },
+    {
+      "id": "account_technical_support",
+      "name": "Account / technical support",
+      "description": "Website, app, account, wishlist, login, or other technical/product-function problem not primarily about an order or payment.",
+      "examples_from_discovery": ["size ... from wishlist ... each time", "I don't see it"]
+    }
+  ],
+  "fallback": {
+    "id": "other_ambiguous",
+    "name": "Other / ambiguous",
+    "action": "escalate",
+    "description": "Use when the message does not clearly match one intent, is primarily a complaint with insufficient issue detail, is multilingual and cannot be reliably interpreted, or requires sensitive/manual handling."
+  },
+  "labeling_rules": [
+    "Label the customer's underlying issue, not the emotion or tone.",
+    "If multiple issues are present, choose the issue that requires the next support action; if no single issue is dominant, use other_ambiguous.",
+    "Delivery delay means the shipment is late; delivery_attempt_problem means the delivery event itself was mishandled or incorrectly recorded.",
+    "Refund is about money being returned; payment_billing is about paying, being charged, or payment failing.",
+    "Keep other_ambiguous available rather than forcing a low-confidence label."
+  ]
+}
