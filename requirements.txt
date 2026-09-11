@@ -1,0 +1,17 @@
+# Core data / ML
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+scikit-learn>=1.5,<2.0
+
+# Retrieval
+sentence-transformers>=3.0,<4.0
+
+# Configuration / validation
+python-dotenv>=1.0,<2.0
+pydantic>=2.7,<3.0
+
+# Evaluation
+scipy>=1.13,<2.0
+
+# Development
+pytest>=8.0,<9.0
