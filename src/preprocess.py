@@ -1,14 +1,15 @@
-"""Extract and reconstruct AmazonHelp support conversations.
+"""Prepare a compact AmazonHelp support corpus without a full-dataset index.
 
-The raw Kaggle dataset is kept local. This script builds a small SQLite index
-from the CSV, finds AmazonHelp tweets, reconstructs connected conversation
-threads through parent/child tweet links, and writes a compact JSONL sample.
+The raw Kaggle CSV stays local and is scanned in chunks. We first collect the
+IDs of customer tweets directly answered by AmazonHelp, then make a second
+pass and keep only those customer tweets plus AmazonHelp replies. This avoids
+creating a multi-million-row SQLite database and keeps disk usage small.
 
 Usage:
     python src/preprocess.py --input data/raw/twcs.csv
 
 Outputs:
-    data/processed/amazonhelp_conversations.jsonl
+    data/processed/amazonhelp_messages.jsonl
     data/processed/amazonhelp_stats.json
 """
 
@@ -16,14 +17,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
-from collections import Counter, deque
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
 BRAND = "AmazonHelp"
-REQUIRED_COLUMNS = {
+COLUMNS = [
     "tweet_id",
     "author_id",
     "inbound",
@@ -31,15 +31,15 @@ REQUIRED_COLUMNS = {
     "text",
     "response_tweet_id",
     "in_response_to_tweet_id",
-}
+]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare AmazonHelp conversations")
+    parser = argparse.ArgumentParser(description="Prepare AmazonHelp support data")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--chunksize", type=int, default=100_000)
-    parser.add_argument("--max-conversations", type=int, default=5000)
+    parser.add_argument("--max-messages", type=int, default=350_000)
     return parser.parse_args()
 
 
@@ -57,167 +57,86 @@ def norm_id(value: object) -> str | None:
 def parse_ids(value: object) -> list[str]:
     if pd.isna(value):
         return []
-    text = str(value).strip()
-    if not text:
-        return []
-    return [x for x in (norm_id(v) for v in text.split(",")) if x]
+    return [x for x in (norm_id(v) for v in str(value).split(",")) if x]
 
 
-def build_index(csv_path: Path, db_path: Path, chunksize: int) -> tuple[int, int]:
-    if db_path.exists():
-        db_path.unlink()
+def read_chunks(path: Path, chunksize: int):
+    return pd.read_csv(path, chunksize=chunksize, usecols=COLUMNS, low_memory=True)
 
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute(
-        """CREATE TABLE tweets (
-            tweet_id TEXT PRIMARY KEY,
-            author_id TEXT NOT NULL,
-            inbound INTEGER NOT NULL,
-            created_at TEXT,
-            text TEXT,
-            parent_id TEXT,
-            response_ids TEXT
-        )"""
-    )
-    conn.execute("CREATE INDEX idx_parent ON tweets(parent_id)")
-    conn.execute("CREATE INDEX idx_author ON tweets(author_id)")
 
-    total = 0
+def collect_targets(csv_path: Path, chunksize: int) -> tuple[set[str], int, int]:
+    """Collect customer parent IDs directly answered by AmazonHelp."""
+    answered_customer_ids: set[str] = set()
     brand_tweets = 0
-    reader = pd.read_csv(
-        csv_path,
-        chunksize=chunksize,
-        usecols=lambda c: c in REQUIRED_COLUMNS,
-        low_memory=True,
-    )
+    total_rows = 0
 
-    for chunk_no, chunk in enumerate(reader, start=1):
-        rows = []
+    for chunk_no, chunk in enumerate(read_chunks(csv_path, chunksize), start=1):
         for row in chunk.itertuples(index=False):
             values = row._asdict()
             tweet_id = norm_id(values["tweet_id"])
             author = str(values["author_id"])
             if not tweet_id:
                 continue
-            inbound = str(values["inbound"]).lower() == "true"
+            total_rows += 1
             if author == BRAND:
                 brand_tweets += 1
-            rows.append(
-                (
-                    tweet_id,
-                    author,
-                    int(inbound),
-                    str(values["created_at"]),
-                    str(values["text"]),
-                    norm_id(values["in_response_to_tweet_id"]),
-                    json.dumps(parse_ids(values["response_tweet_id"])),
-                )
-            )
-        conn.executemany(
-            "INSERT OR REPLACE INTO tweets VALUES (?, ?, ?, ?, ?, ?, ?)", rows
-        )
-        conn.commit()
-        total += len(rows)
+                parent = norm_id(values["in_response_to_tweet_id"])
+                if parent:
+                    answered_customer_ids.add(parent)
         if chunk_no % 10 == 0:
-            print(f"Indexed {total:,} rows...", flush=True)
+            print(f"Pass 1 scanned {total_rows:,} rows...", flush=True)
 
-    conn.close()
-    return total, brand_tweets
+    return answered_customer_ids, total_rows, brand_tweets
 
 
-def reconstruct(db_path: Path, output_path: Path, max_conversations: int) -> dict:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def write_compact_corpus(
+    csv_path: Path,
+    output_path: Path,
+    target_ids: set[str],
+    chunksize: int,
+    max_messages: int,
+) -> tuple[int, Counter]:
+    """Second pass: retain AmazonHelp replies and their directly answered parents."""
+    seen: set[str] = set()
+    counts: Counter = Counter()
+    written = 0
 
-    brand_ids = [
-        row[0]
-        for row in conn.execute(
-            "SELECT tweet_id FROM tweets WHERE author_id = ?", (BRAND,)
-        )
-    ]
+    with output_path.open("w", encoding="utf-8") as out:
+        for chunk_no, chunk in enumerate(read_chunks(csv_path, chunksize), start=1):
+            for row in chunk.itertuples(index=False):
+                values = row._asdict()
+                tweet_id = norm_id(values["tweet_id"])
+                author = str(values["author_id"])
+                if not tweet_id or tweet_id in seen:
+                    continue
 
-    # Conversation membership is the connected component of each AmazonHelp
-    # tweet when following parent links and response_tweet_id child links.
-    visited: set[str] = set()
-    conversations: list[list[dict]] = []
+                keep = author == BRAND or tweet_id in target_ids
+                if not keep:
+                    continue
 
-    for seed in brand_ids:
-        if seed in visited:
-            continue
-        queue = deque([seed])
-        component: set[str] = set()
-
-        while queue:
-            tweet_id = queue.popleft()
-            if tweet_id in component:
-                continue
-            row = conn.execute(
-                "SELECT * FROM tweets WHERE tweet_id = ?", (tweet_id,)
-            ).fetchone()
-            if row is None:
-                continue
-            component.add(tweet_id)
-
-            parent = row["parent_id"]
-            if parent and parent not in component:
-                queue.append(parent)
-
-            for child in json.loads(row["response_ids"] or "[]"):
-                if child not in component:
-                    queue.append(child)
-
-            # Parent links alone are enough for the common case, but querying
-            # children makes reconstruction robust when response IDs are noisy.
-            for child_row in conn.execute(
-                "SELECT tweet_id FROM tweets WHERE parent_id = ?", (tweet_id,)
-            ):
-                child = child_row[0]
-                if child not in component:
-                    queue.append(child)
-
-        visited.update(component)
-        rows = [
-            dict(conn.execute("SELECT * FROM tweets WHERE tweet_id = ?", (tid,)).fetchone())
-            for tid in component
-        ]
-        rows.sort(key=lambda r: r["created_at"] or "")
-        brand_count = sum(r["author_id"] == BRAND for r in rows)
-        inbound_count = sum(bool(r["inbound"]) for r in rows)
-        if brand_count and inbound_count:
-            conversations.append(rows)
-        if len(conversations) >= max_conversations:
-            break
-
-    with output_path.open("w", encoding="utf-8") as f:
-        for rows in conversations:
-            clean_rows = [
-                {
-                    "tweet_id": r["tweet_id"],
-                    "author_id": r["author_id"],
-                    "inbound": bool(r["inbound"]),
-                    "created_at": r["created_at"],
-                    "text": r["text"],
-                    "in_response_to_tweet_id": r["parent_id"],
+                record = {
+                    "tweet_id": tweet_id,
+                    "author_id": author,
+                    "inbound": str(values["inbound"]).lower() == "true",
+                    "created_at": str(values["created_at"]),
+                    "text": str(values["text"]),
+                    "in_response_to_tweet_id": norm_id(values["in_response_to_tweet_id"]),
+                    "response_tweet_ids": parse_ids(values["response_tweet_id"]),
                 }
-                for r in rows
-            ]
-            f.write(json.dumps({"messages": clean_rows}, ensure_ascii=False) + "\n")
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                seen.add(tweet_id)
+                written += 1
+                counts["brand_messages"] += author == BRAND
+                counts["customer_messages"] += author != BRAND
 
-    lengths = [len(c) for c in conversations]
-    stats = {
-        "brand": BRAND,
-        "conversation_count": len(conversations),
-        "messages_in_conversations": sum(lengths),
-        "median_messages_per_conversation": sorted(lengths)[len(lengths) // 2] if lengths else 0,
-        "max_messages_per_conversation": max(lengths, default=0),
-        "multi_turn_conversations": sum(x >= 3 for x in lengths),
-        "inbound_messages": sum(sum(bool(r["inbound"]) for r in c) for c in conversations),
-        "outbound_messages": sum(sum(not bool(r["inbound"]) for r in c) for c in conversations),
-    }
-    conn.close()
-    return stats
+                if written >= max_messages:
+                    break
+            if chunk_no % 10 == 0:
+                print(f"Pass 2 scanned; wrote {written:,} relevant messages...", flush=True)
+            if written >= max_messages:
+                break
+
+    return written, counts
 
 
 def main() -> None:
@@ -225,19 +144,37 @@ def main() -> None:
     if not args.input.exists():
         raise FileNotFoundError(args.input)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = args.output_dir / "twcs_index.sqlite"
-    output_path = args.output_dir / "amazonhelp_conversations.jsonl"
+
+    output_path = args.output_dir / "amazonhelp_messages.jsonl"
     stats_path = args.output_dir / "amazonhelp_stats.json"
 
-    print("=== Building local tweet index ===")
-    total, brand_tweets = build_index(args.input, db_path, args.chunksize)
-    print(f"Indexed rows: {total:,}")
+    print("=== Pass 1: finding AmazonHelp customer messages ===")
+    target_ids, total_rows, brand_tweets = collect_targets(args.input, args.chunksize)
+    print(f"Rows scanned: {total_rows:,}")
     print(f"AmazonHelp tweets: {brand_tweets:,}")
+    print(f"Unique customer tweets answered: {len(target_ids):,}")
 
-    print("\n=== Reconstructing AmazonHelp conversations ===")
-    stats = reconstruct(db_path, output_path, args.max_conversations)
+    print("\n=== Pass 2: writing compact support corpus ===")
+    written, counts = write_compact_corpus(
+        args.input, output_path, target_ids, args.chunksize, args.max_messages
+    )
+
+    # Conversation-level statistics are intentionally based on direct
+    # customer -> AmazonHelp links, which are reliable in the TWCS schema.
+    stats = {
+        "brand": BRAND,
+        "raw_rows_scanned": total_rows,
+        "brand_tweets": brand_tweets,
+        "unique_customer_tweets_answered": len(target_ids),
+        "compact_messages_written": written,
+        "customer_messages_written": counts["customer_messages"],
+        "brand_messages_written": counts["brand_messages"],
+        "corpus_definition": "AmazonHelp tweets plus customer tweets directly referenced by AmazonHelp's in_response_to_tweet_id",
+        "max_messages": args.max_messages,
+    }
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
+    print("\n=== Done ===")
     print(json.dumps(stats, indent=2))
     print(f"\nWrote: {output_path}")
     print(f"Wrote: {stats_path}")
