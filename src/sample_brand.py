@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def normalized_ids(series: pd.Series) -> pd.Series:
+    """Normalize CSV numeric IDs so 3 and 3.0 compare as the same tweet ID."""
+    return pd.to_numeric(series, errors="coerce").astype("Int64").astype("string")
+
+
 def main() -> None:
     args = parse_args()
     if not args.input.exists():
@@ -57,8 +62,8 @@ def main() -> None:
 
     for chunk_number, chunk in enumerate(reader, start=1):
         inbound_mask = chunk["inbound"].astype(str).str.lower().eq("true")
-        ids = chunk.loc[inbound_mask, "tweet_id"].dropna().astype(str)
-        inbound_ids.update(ids)
+        ids = normalized_ids(chunk.loc[inbound_mask, "tweet_id"]).dropna()
+        inbound_ids.update(ids.tolist())
         total_inbound += int(inbound_mask.sum())
         total_rows += len(chunk)
 
@@ -78,18 +83,19 @@ def main() -> None:
     for chunk_number, chunk in enumerate(reader, start=1):
         inbound_mask = chunk["inbound"].astype(str).str.lower().eq("true")
         outbound_mask = ~inbound_mask
-        outbound_rows = chunk.loc[outbound_mask, ["author_id", "in_response_to_tweet_id"]].dropna(
-            subset=["author_id"]
-        )
+        outbound_rows = chunk.loc[
+            outbound_mask, ["author_id", "in_response_to_tweet_id"]
+        ].dropna(subset=["author_id", "in_response_to_tweet_id"])
 
         outbound.update(chunk.loc[outbound_mask, "author_id"].astype(str))
         total_outbound += int(outbound_mask.sum())
 
-        for row in outbound_rows.itertuples(index=False):
-            brand = str(row.author_id)
-            parent_id = str(row.in_response_to_tweet_id)
-            if parent_id in inbound_ids:
-                answered_by_brand[brand].add(parent_id)
+        parent_ids = normalized_ids(outbound_rows["in_response_to_tweet_id"])
+        for brand, parent_id in zip(
+            outbound_rows["author_id"].astype(str), parent_ids
+        ):
+            if pd.notna(parent_id) and parent_id in inbound_ids:
+                answered_by_brand[brand].add(str(parent_id))
 
         total_rows_pass2 += len(chunk)
         if chunk_number % 10 == 0:
