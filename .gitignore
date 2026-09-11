@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# Data and generated artifacts
+*.csv
+*.parquet
+*.jsonl
+*.pkl
+*.joblib
+/data/raw/
+/data/processed/
+/evaluation/results/
+
+# Local tooling
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
+.vscode/
